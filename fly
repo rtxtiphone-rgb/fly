@@ -1,0 +1,823 @@
+local Players      = game:GetService("Players")
+local UIS          = game:GetService("UserInputService")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local CoreGui      = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+
+if not ALLOWED_IDS[player.UserId] then
+    warn(("[FlyScript] Access denied for %s (%d)"):format(player.Name, player.UserId))
+    return
+end
+
+-- ─── CONFIG ───
+local SPEED      = 80
+local MIN_SPEED  = 5
+local MAX_SPEED  = 5000
+local VEL_SMOOTH = 5
+local ROT_SMOOTH = 55
+local DEBUG      = true
+
+local flying   = false
+local typing   = false
+local curVel   = Vector3.zero
+local bv, bg, hum, root
+local savedWalk, savedJump
+local PlayerModule, Controls
+local refreshUI = function() end
+
+-- ─── KEYBIND ───
+local TOGGLE_KEY   = Enum.KeyCode.F
+local TOGGLE_MOUSE = nil
+local capturingKey = false
+local captureStart = 0
+local updateKeybindLabel = function() end
+
+-- ─── COLORS ───
+local C = {
+    bg      = Color3.fromRGB(17, 17, 27),
+    panel   = Color3.fromRGB(24, 24, 37),
+    panel2  = Color3.fromRGB(30, 30, 46),
+    accent  = Color3.fromRGB(137, 180, 250),
+    text    = Color3.fromRGB(205, 214, 244),
+    textDim = Color3.fromRGB(108, 112, 134),
+    success = Color3.fromRGB(166, 227, 161),
+    danger  = Color3.fromRGB(243, 139, 168),
+    stroke  = Color3.fromRGB(49, 50, 68),
+}
+
+-- ═══════════════════════════════════════════
+--  🛡️ PHYSICS WATCHDOG (Global settings)
+-- ═══════════════════════════════════════════
+local TARGET_STEPPING = Enum.PhysicsSteppingMethod.Fixed
+local TARGET_FPSCAP   = 240
+
+local function applyPhysicsSettings()
+    pcall(function()
+        if workspace.PhysicsSteppingMethod ~= TARGET_STEPPING then
+            workspace.PhysicsSteppingMethod = TARGET_STEPPING
+        end
+    end)
+end
+
+local function applyFpsCap()
+    pcall(function() setfpscap(TARGET_FPSCAP) end)
+end
+
+applyPhysicsSettings()
+applyFpsCap()
+
+pcall(function()
+    workspace:GetPropertyChangedSignal("PhysicsSteppingMethod"):Connect(applyPhysicsSettings)
+end)
+
+local physAccum, fpsAccum = 0, 0
+RunService.Heartbeat:Connect(function(dt)
+    physAccum += dt
+    fpsAccum  += dt
+    if physAccum >= 0.5 then
+        physAccum = 0
+        applyPhysicsSettings()
+    end
+    if fpsAccum >= 5 then
+        fpsAccum = 0
+        applyFpsCap()
+    end
+end)
+
+-- ─── PLAYER MODULE (with timeout) ───
+pcall(function()
+    local ps = player:WaitForChild("PlayerScripts", 5)
+    if not ps then return end
+    local pm = ps:WaitForChild("PlayerModule", 5)
+    if not pm then return end
+    PlayerModule = require(pm)
+    Controls = PlayerModule:GetControls()
+end)
+
+UIS.TextBoxFocused:Connect(function()   typing = true  end)
+UIS.TextBoxFocusReleased:Connect(function() typing = false end)
+
+-- ─── FLY ───
+local function cleanChar(char)
+    for _,v in ipairs(char:GetDescendants()) do
+        if v.Name == "FlyScript_Vel" or v.Name == "FlyScript_Gyro" then
+            v:Destroy()
+        end
+    end
+end
+
+local function setup(char)
+    cleanChar(char)
+    root = char:WaitForChild("HumanoidRootPart", 5)
+    hum  = char:WaitForChild("Humanoid", 5)
+end
+
+local function ensureChar()
+    if root and root.Parent and hum and hum.Parent then return true end
+    if player.Character then
+        setup(player.Character)
+        return root ~= nil and hum ~= nil
+    end
+    return false
+end
+
+local function makeBV()
+    local v = Instance.new("BodyVelocity")
+    v.Name = "FlyScript_Vel"
+    v.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    v.Velocity = curVel
+    v.Parent = root
+    return v
+end
+
+local function makeBG()
+    local g = Instance.new("BodyGyro")
+    g.Name = "FlyScript_Gyro"
+    g.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+    g.P = 8000
+    g.D = 1000
+    g.CFrame = root and root.CFrame or CFrame.new()
+    g.Parent = root
+    return g
+end
+
+if player.Character then setup(player.Character) end
+
+player.CharacterAdded:Connect(function(c)
+    flying = false
+    bv, bg = nil, nil
+    if Controls then pcall(function() Controls:Enable() end) end
+
+    task.wait(0.5)
+
+    setup(c)
+    applyPhysicsSettings()
+    applyFpsCap()
+    refreshUI()
+end)
+
+local function startFly()
+    if not ensureChar() then
+        if DEBUG then warn("[FlyScript] ตัวละครยังไม่พร้อม") end
+        return
+    end
+    if not ALLOWED_IDS[player.UserId] then return end
+
+    savedWalk = hum.WalkSpeed
+    savedJump = hum.JumpPower
+
+    bv = makeBV()
+    bg = makeBG()
+
+    curVel = Vector3.zero
+    flying = true
+
+    hum.PlatformStand = true
+    hum.WalkSpeed = 0
+    hum.JumpPower = 0
+    if Controls then pcall(function() Controls:Disable() end) end
+
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    end)
+
+    refreshUI()
+end
+
+local function stopFly()
+    flying = false
+    if bv then bv:Destroy(); bv = nil end
+    if bg then bg:Destroy(); bg = nil end
+
+    if hum then
+        hum.PlatformStand = false
+        hum.WalkSpeed = savedWalk or 16
+        hum.JumpPower = savedJump or 50
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+        end)
+    end
+    if Controls then pcall(function() Controls:Enable() end) end
+    curVel = Vector3.zero
+    refreshUI()
+end
+
+-- ─── HELPERS ───
+local function corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = parent
+    return c
+end
+
+local function stroke(parent, color, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or C.stroke
+    s.Thickness = thickness or 1
+    s.Parent = parent
+    return s
+end
+
+-- ─── GUI ───
+local gui = Instance.new("ScreenGui")
+gui.Name = "FlyModuleUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.Parent = player:FindFirstChild("PlayerGui") or CoreGui
+
+local WIN_W  = 220
+local FULL_H = 260
+local MIN_H  = 40
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(WIN_W, FULL_H)
+main.Position = UDim2.new(0.5, -110, 0.5, -130)
+main.BackgroundColor3 = C.panel
+main.BorderSizePixel = 0
+main.Active = true
+main.ClipsDescendants = true
+main.Parent = gui
+corner(main, 12)
+stroke(main, C.stroke, 1)
+
+-- ─── UISCALE ───
+local MIN_SCALE = 0.7
+local MAX_SCALE = 1.6
+
+local uiScale = Instance.new("UIScale")
+uiScale.Scale = 1
+uiScale.Parent = main
+
+local function setUIScale(s)
+    s = math.clamp(s, MIN_SCALE, MAX_SCALE)
+    uiScale.Scale = s
+    return s
+end
+
+local function getUIScale()
+    return uiScale.Scale
+end
+
+-- ─── TITLE BAR ───
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 40)
+titleBar.BackgroundColor3 = C.panel2
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+corner(titleBar, 12)
+
+local cover = Instance.new("Frame")
+cover.Size = UDim2.new(1, 0, 0, 12)
+cover.Position = UDim2.new(0, 0, 1, -12)
+cover.BackgroundColor3 = C.panel2
+cover.BorderSizePixel = 0
+cover.Parent = titleBar
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.fromOffset(14, 0)
+title.BackgroundTransparency = 1
+title.Text = "⚡  FLY MODULE"
+title.TextColor3 = C.text
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.fromOffset(28, 28)
+minBtn.Position = UDim2.new(1, -34, 0.5, -14)
+minBtn.BackgroundColor3 = C.bg
+minBtn.BorderSizePixel = 0
+minBtn.Text = "—"
+minBtn.TextColor3 = C.text
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 16
+minBtn.AutoButtonColor = false
+minBtn.Active = true
+minBtn.Parent = titleBar
+corner(minBtn, 6)
+
+-- ─── CONTENT ───
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -24, 1, -52)
+content.Position = UDim2.fromOffset(12, 48)
+content.BackgroundTransparency = 1
+content.Parent = main
+
+-- fly button
+local flyBtn = Instance.new("TextButton")
+flyBtn.Size = UDim2.new(1, 0, 0, 44)
+flyBtn.BackgroundColor3 = C.panel2
+flyBtn.BorderSizePixel = 0
+flyBtn.Text = "START FLY"
+flyBtn.TextColor3 = C.text
+flyBtn.Font = Enum.Font.GothamBold
+flyBtn.TextSize = 14
+flyBtn.AutoButtonColor = false
+flyBtn.Active = true
+flyBtn.Selectable = false
+flyBtn.ZIndex = 5
+flyBtn.Parent = content
+corner(flyBtn, 8)
+local flyStroke = stroke(flyBtn, C.accent, 1.5)
+
+-- ─── SPEED ROW (label + editable TextBox) ───
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Size = UDim2.fromOffset(52, 18)
+speedLabel.Position = UDim2.fromOffset(0, 59)
+speedLabel.BackgroundTransparency = 1
+speedLabel.Text = "Speed:"
+speedLabel.TextColor3 = C.textDim
+speedLabel.Font = Enum.Font.Gotham
+speedLabel.TextSize = 12
+speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+speedLabel.Parent = content
+
+local speedInput = Instance.new("TextBox")
+speedInput.Size = UDim2.fromOffset(72, 18)
+speedInput.Position = UDim2.fromOffset(52, 59)
+speedInput.BackgroundColor3 = C.panel2
+speedInput.BorderSizePixel = 0
+speedInput.Text = tostring(SPEED)
+speedInput.TextColor3 = C.accent
+speedInput.PlaceholderText = "5 - 5000"
+speedInput.PlaceholderColor3 = C.textDim
+speedInput.Font = Enum.Font.GothamBold
+speedInput.TextSize = 12
+speedInput.TextXAlignment = Enum.TextXAlignment.Left
+speedInput.ClearTextOnFocus = false
+speedInput.Parent = content
+corner(speedInput, 4)
+stroke(speedInput, C.stroke, 1)
+
+-- slider
+local slider = Instance.new("Frame")
+slider.Size = UDim2.new(1, 0, 0, 6)
+slider.Position = UDim2.fromOffset(0, 88)
+slider.BackgroundColor3 = C.panel2
+slider.BorderSizePixel = 0
+slider.Parent = content
+corner(slider, 3)
+
+local initAlpha = math.log(SPEED / MIN_SPEED) / math.log(MAX_SPEED / MIN_SPEED)
+
+local fill = Instance.new("Frame")
+fill.Size = UDim2.new(initAlpha, 0, 1, 0)
+fill.BackgroundColor3 = C.accent
+fill.BorderSizePixel = 0
+fill.Parent = slider
+corner(fill, 3)
+
+local knob = Instance.new("Frame")
+knob.Size = UDim2.fromOffset(14, 14)
+knob.Position = UDim2.new(initAlpha, 0, 0.5, 0)
+knob.AnchorPoint = Vector2.new(0.5, 0.5)
+knob.BackgroundColor3 = C.text
+knob.BorderSizePixel = 0
+knob.ZIndex = 2
+knob.Parent = slider
+corner(knob, 7)
+
+local hitbox = Instance.new("TextButton")
+hitbox.Size = UDim2.new(1, 0, 3, 0)
+hitbox.Position = UDim2.new(0, 0, 0.5, 0)
+hitbox.AnchorPoint = Vector2.new(0, 0.5)
+hitbox.BackgroundTransparency = 1
+hitbox.Text = ""
+hitbox.ZIndex = 3
+hitbox.Active = true
+hitbox.Parent = slider
+
+-- ═══════════════════════════════════════════
+--  🎯 SPEED SETTER (single source of truth)
+-- ═══════════════════════════════════════════
+local function setSpeedValue(v)
+    local n = tonumber(v)
+    if not n then return SPEED end
+    n = math.clamp(math.floor(n + 0.5), MIN_SPEED, MAX_SPEED)
+    SPEED = n
+
+    local alpha = math.log(n / MIN_SPEED) / math.log(MAX_SPEED / MIN_SPEED)
+    fill.Size     = UDim2.new(alpha, 0, 1, 0)
+    knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+
+    if speedInput.Text ~= tostring(n) then
+        speedInput.Text = tostring(n)
+    end
+    return n
+end
+
+setSpeedValue(SPEED)
+
+speedInput.FocusLost:Connect(function()
+    setSpeedValue(speedInput.Text)
+    speedInput.Text = tostring(SPEED)
+end)
+
+-- keybind row
+local keybindRow = Instance.new("Frame")
+keybindRow.Size = UDim2.new(1, 0, 0, 26)
+keybindRow.Position = UDim2.fromOffset(0, 110)
+keybindRow.BackgroundColor3 = C.panel2
+keybindRow.BorderSizePixel = 0
+keybindRow.Parent = content
+corner(keybindRow, 6)
+
+local keybindTitle = Instance.new("TextLabel")
+keybindTitle.Size = UDim2.new(1, -100, 1, 0)
+keybindTitle.Position = UDim2.fromOffset(10, 0)
+keybindTitle.BackgroundTransparency = 1
+keybindTitle.Text = "Toggle Key"
+keybindTitle.TextColor3 = C.textDim
+keybindTitle.Font = Enum.Font.Gotham
+keybindTitle.TextSize = 11
+keybindTitle.TextXAlignment = Enum.TextXAlignment.Left
+keybindTitle.Parent = keybindRow
+
+local keybindBtn = Instance.new("TextButton")
+keybindBtn.Size = UDim2.fromOffset(76, 20)
+keybindBtn.Position = UDim2.new(1, -84, 0.5, -10)
+keybindBtn.BackgroundColor3 = C.bg
+keybindBtn.BorderSizePixel = 0
+keybindBtn.Text = TOGGLE_KEY.Name
+keybindBtn.TextColor3 = C.accent
+keybindBtn.Font = Enum.Font.GothamBold
+keybindBtn.TextSize = 11
+keybindBtn.AutoButtonColor = false
+keybindBtn.Active = true
+keybindBtn.Parent = keybindRow
+corner(keybindBtn, 4)
+stroke(keybindBtn, C.accent, 1)
+
+updateKeybindLabel = function()
+    if TOGGLE_MOUSE == Enum.UserInputType.MouseButton1 then
+        keybindBtn.Text = "LMB"
+    elseif TOGGLE_MOUSE == Enum.UserInputType.MouseButton2 then
+        keybindBtn.Text = "RMB"
+    elseif TOGGLE_MOUSE == Enum.UserInputType.MouseButton3 then
+        keybindBtn.Text = "MMB"
+    else
+        keybindBtn.Text = TOGGLE_KEY.Name
+    end
+end
+
+-- hint (Space/Shift ถูกลบออกแล้ว)
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, 0, 0, 14)
+hint.Position = UDim2.fromOffset(0, 146)
+hint.BackgroundTransparency = 1
+hint.Text = "WASD • Camera-relative"
+hint.TextColor3 = C.textDim
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 10
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.Parent = content
+
+-- status
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 16)
+status.Position = UDim2.fromOffset(0, 170)
+status.BackgroundTransparency = 1
+status.Text = "● Idle"
+status.TextColor3 = C.textDim
+status.Font = Enum.Font.Gotham
+status.TextSize = 11
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = content
+
+refreshUI = function()
+    if flying then
+        flyBtn.Text = "STOP FLY"
+        flyBtn.BackgroundColor3 = Color3.fromRGB(45, 30, 40)
+        flyStroke.Color = C.danger
+        status.Text = "● Flying"
+        status.TextColor3 = C.success
+    else
+        flyBtn.Text = "START FLY"
+        flyBtn.BackgroundColor3 = C.panel2
+        flyStroke.Color = C.accent
+        status.Text = "● Idle"
+        status.TextColor3 = C.textDim
+    end
+end
+refreshUI()
+
+-- ─── RESIZE HANDLE ───
+local resizeHandle = Instance.new("TextButton")
+resizeHandle.Name = "ResizeHandle"
+resizeHandle.Size = UDim2.fromOffset(18, 18)
+resizeHandle.Position = UDim2.new(1, -18, 1, -18)
+resizeHandle.BackgroundTransparency = 1
+resizeHandle.Text = ""
+resizeHandle.TextColor3 = C.textDim
+resizeHandle.Font = Enum.Font.GothamBold
+resizeHandle.TextSize = 14
+resizeHandle.AutoButtonColor = false
+resizeHandle.Active = true
+resizeHandle.ZIndex = 10
+resizeHandle.Parent = main
+
+local resizing = false
+local resizeStartX, resizeStartY, resizeStartScale
+local lastClickTime = 0
+
+resizeHandle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        resizing = true
+        resizeStartX = input.Position.X
+        resizeStartY = input.Position.Y
+        resizeStartScale = uiScale.Scale
+
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local now = tick()
+            if now - lastClickTime < 0.35 then
+                setUIScale(1)
+                resizing = false
+            end
+            lastClickTime = now
+        end
+    end
+end)
+
+UIS.InputChanged:Connect(function(input)
+    if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        local dx = input.Position.X - resizeStartX
+        local dy = input.Position.Y - resizeStartY
+        setUIScale(resizeStartScale + (dx + dy) / 400)
+    end
+end)
+
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        resizing = false
+    end
+end)
+
+-- ─── DRAG ───
+local dragging, dragStart, startPos = false, nil, nil
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                   startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- ─── MINIMIZE / RESTORE ───
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    minBtn.Text = minimized and "□" or "—"
+    resizeHandle.Visible = not minimized
+    TweenService:Create(
+        main,
+        TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+        { Size = UDim2.fromOffset(WIN_W, minimized and MIN_H or FULL_H) }
+    ):Play()
+end)
+
+-- ─── FLY BUTTON ───
+flyBtn.Activated:Connect(function()
+    if flying then stopFly() else startFly() end
+end)
+flyBtn.MouseEnter:Connect(function()
+    TweenService:Create(flyStroke, TweenInfo.new(0.15), { Thickness = 2.5 }):Play()
+end)
+flyBtn.MouseLeave:Connect(function()
+    TweenService:Create(flyStroke, TweenInfo.new(0.15), { Thickness = 1.5 }):Play()
+end)
+
+-- ─── KEYBIND CAPTURE ───
+keybindBtn.Activated:Connect(function()
+    if capturingKey then
+        capturingKey = false
+        keybindBtn.TextColor3 = C.accent
+        keybindTitle.Text = "Toggle Key"
+        keybindTitle.TextColor3 = C.textDim
+        updateKeybindLabel()
+        return
+    end
+    capturingKey = true
+    captureStart = tick()
+    keybindBtn.Text = "..."
+    keybindBtn.TextColor3 = C.danger
+    keybindTitle.Text = "Press any key"
+    keybindTitle.TextColor3 = C.accent
+end)
+
+-- ─── INPUT (Capture + Toggle) ───
+UIS.InputBegan:Connect(function(i, gp)
+    if capturingKey then
+        if tick() - captureStart < 0.2 then return end
+        if gp and i.UserInputType == Enum.UserInputType.Keyboard then return end
+
+        local uiType = i.UserInputType
+        if uiType == Enum.UserInputType.Keyboard then
+            if i.KeyCode == Enum.KeyCode.Unknown or i.KeyCode == Enum.KeyCode.Escape then
+                capturingKey = false
+                keybindBtn.TextColor3 = C.accent
+                keybindTitle.Text = "Toggle Key"
+                keybindTitle.TextColor3 = C.textDim
+                updateKeybindLabel()
+                return
+            end
+            TOGGLE_KEY = i.KeyCode
+            TOGGLE_MOUSE = nil
+        elseif uiType == Enum.UserInputType.MouseButton1
+            or uiType == Enum.UserInputType.MouseButton2
+            or uiType == Enum.UserInputType.MouseButton3 then
+            TOGGLE_MOUSE = uiType
+        else
+            capturingKey = false
+            keybindBtn.TextColor3 = C.accent
+            keybindTitle.Text = "Toggle Key"
+            keybindTitle.TextColor3 = C.textDim
+            updateKeybindLabel()
+            return
+        end
+
+        capturingKey = false
+        keybindBtn.TextColor3 = C.accent
+        keybindTitle.Text = "Toggle Key"
+        keybindTitle.TextColor3 = C.textDim
+        updateKeybindLabel()
+        return
+    end
+
+    if gp then return end
+    if typing then return end
+
+    local isToggle
+    if TOGGLE_MOUSE then
+        isToggle = (i.UserInputType == TOGGLE_MOUSE)
+    else
+        isToggle = (i.UserInputType == Enum.UserInputType.Keyboard
+                    and i.KeyCode == TOGGLE_KEY)
+    end
+
+    if isToggle then
+        if flying then stopFly() else startFly() end
+    end
+end)
+
+-- ─── SLIDER ───
+local sliderDragging = false
+local function updateSlider(mouseX)
+    local ax = slider.AbsolutePosition.X
+    local aw = slider.AbsoluteSize.X
+    local alpha = math.clamp((mouseX - ax) / aw, 0, 1)
+    local ratio = MAX_SPEED / MIN_SPEED
+    setSpeedValue(MIN_SPEED * (ratio ^ alpha))
+end
+hitbox.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = true
+        updateSlider(input.Position.X)
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if sliderDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        updateSlider(input.Position.X)
+    end
+end)
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = false
+    end
+end)
+
+-- ═══════════════════════════════════════════
+--  🔄 UPDATE LOOP + 🛡️ FLY WATCHDOG
+-- ═══════════════════════════════════════════
+local wdControlsAccum = 0
+local wdHumanoidAccum = 0
+
+RunService.PreSimulation:Connect(function(dt)
+    if not flying then return end
+
+    -- 1) ตรวจสอบตัวละคร
+    if not root or not root.Parent or not hum or not hum.Parent then
+        if not ensureChar() then
+            stopFly()
+            return
+        end
+    end
+
+    -- 2) BodyVelocity integrity
+    if not bv or not bv.Parent or bv.Parent ~= root then
+        if bv and bv.Parent then pcall(function() bv:Destroy() end) end
+        bv = makeBV()
+    end
+
+    -- 3) BodyGyro integrity
+    if not bg or not bg.Parent or bg.Parent ~= root then
+        if bg and bg.Parent then pcall(function() bg:Destroy() end) end
+        bg = makeBG()
+    end
+
+    -- 4) 🛡️ Humanoid state guard
+    wdHumanoidAccum += dt
+    if wdHumanoidAccum >= 0.1 then
+        wdHumanoidAccum = 0
+        if hum then
+            if not hum.PlatformStand then hum.PlatformStand = true end
+            if hum.WalkSpeed ~= 0 then hum.WalkSpeed = 0 end
+            if hum.JumpPower ~= 0 then hum.JumpPower = 0 end
+
+            local currentState = hum:GetState()
+            if currentState == Enum.HumanoidStateType.Freefall
+            or currentState == Enum.HumanoidStateType.FallingDown
+            or currentState == Enum.HumanoidStateType.Ragdoll
+            or currentState == Enum.HumanoidStateType.Landed then
+                hum:ChangeState(Enum.HumanoidStateType.Physics)
+            end
+        end
+    end
+
+    -- 5) Controls guard (ทุก ~0.5s)
+    wdControlsAccum += dt
+    if wdControlsAccum >= 0.5 then
+        wdControlsAccum = 0
+        if Controls then pcall(function() Controls:Disable() end) end
+    end
+
+    -- 6) อัปเดตการบิน
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local cf = cam.CFrame
+
+    if typing then
+        curVel = curVel:Lerp(Vector3.zero, 1 - math.exp(-VEL_SMOOTH * dt))
+        bv.Velocity = curVel
+        return
+    end
+
+    local dir = Vector3.zero
+    if UIS:IsKeyDown(Enum.KeyCode.W) then dir += cf.LookVector  end
+    if UIS:IsKeyDown(Enum.KeyCode.S) then dir -= cf.LookVector  end
+    if UIS:IsKeyDown(Enum.KeyCode.D) then dir += cf.RightVector end
+    if UIS:IsKeyDown(Enum.KeyCode.A) then dir -= cf.RightVector end
+    -- ↑ Space/Shift ถูกลบออกแล้ว (ไม่มี vertical movement)
+
+    local target = dir.Magnitude > 0.01 and dir.Unit * SPEED or Vector3.zero
+    curVel = curVel:Lerp(target, 1 - math.exp(-VEL_SMOOTH * dt))
+    bv.Velocity = curVel
+
+    bg.CFrame = bg.CFrame:Lerp(cf, 1 - math.exp(-ROT_SMOOTH * dt))
+end)
+
+-- ─── DEATH SAFETY ───
+player.CharacterRemoving:Connect(function()
+    if flying then stopFly() end
+end)
+
+-- ═══════════════════════════════════════════
+--  🧩 EXPOSE API
+-- ═══════════════════════════════════════════
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+env.FlyUI = {
+    setScale   = setUIScale,
+    getScale   = getUIScale,
+    setSpeed   = function(v) return setSpeedValue(v) end,
+    getSpeed   = function() return SPEED end,
+    toggle     = function() if flying then stopFly() else startFly() end end,
+    show       = function() main.Visible = true  end,
+    hide       = function() main.Visible = false end,
+    destroy    = function() gui:Destroy() end,
+    fixPhysics = function() applyPhysicsSettings(); applyFpsCap() end,
+}
